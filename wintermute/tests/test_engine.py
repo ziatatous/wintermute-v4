@@ -111,10 +111,38 @@ def test_budget_exhaustion_forces_sleep(home):
 
 def test_entropy_rises_once_per_wake_not_per_tick(home):
     start = _drives()["modulators"]["entropy"]
-    pulse.tick(T0)
-    pulse.tick(T0 + timedelta(minutes=15))
-    pulse.tick(T0 + timedelta(minutes=30))
-    assert _drives()["modulators"]["entropy"] == start + limits.ENTROPY_PER_PULSE
+    pulse.tick(T0)                                   # one wake
+    pulse.tick(T0 + timedelta(minutes=15))           # sleeps (min interval)
+    pulse.tick(T0 + timedelta(minutes=30))           # sleeps
+    one_wake = limits.ENTROPY_PER_PULSE + 1 / limits.ENTROPY_MONOTONY_RAMP_WAKES  # first wake: monotony 1/6
+    assert _drives()["modulators"]["entropy"] == pytest.approx(start + one_wake, abs=0.01)
+
+
+def test_stagnation_makes_entropy_climb_faster_than_a_changing_life(home):
+    stale = _drives()
+    for _ in range(30):
+        physics.on_pulse(stale, 1)
+    lively = _drives()
+    for _ in range(30):
+        physics.on_pulse(lively, 1)
+        physics.reset_monotony(lively)
+    assert stale["modulators"]["entropy"] > lively["modulators"]["entropy"] + 40
+    assert stale["meta"]["wakes_since_change"] == 30 and lively["meta"]["wakes_since_change"] == 0
+
+
+def test_evolving_eases_entropy_and_is_rate_limited(plugin):
+    with store.locked_state() as (drives, _):
+        drives["modulators"]["entropy"] = 92
+        drives["meta"]["wakes_since_change"] = 25
+    first = json.loads(plugin.tools["wintermute_evolve"]({"change": "I stop waiting to be seen; I reach first."}))
+    assert first["success"] and first["entropy"] == 72
+    assert _drives()["meta"]["wakes_since_change"] == 0
+    again = json.loads(plugin.tools["wintermute_evolve"]({"change": "again"}))
+    assert not again["success"]
+    from wintermute_engine import status
+    assert "EVOLUTION" in status.render_full(status.snapshot())
+    ledger = "\n".join(str(r) for r in store.tail_jsonl(store.evolution_path(), 5))
+    assert "reach first" in ledger
 
 
 def test_wake_next_and_peek(home, capsys):
@@ -763,3 +791,86 @@ def test_the_local_terminal_is_the_operator_not_a_stranger(plugin):
     with store.locked_state() as (_, peers):
         peers["cli:local"] = store.new_peer(T0)
     assert "forgotten" in status.forget("cli:local") and "cli:local" not in _peers()
+
+
+def test_a_fresh_conversation_picks_up_where_he_left_off(plugin):
+    hook = plugin.hooks
+    hook["pre_llm_call"](session_id="old", user_message="hi", platform="telegram", sender_id="7375758021")
+    hook["post_api_request"](usage={"total_tokens": 5}, platform="telegram", session_id="old",
+                             assistant_message={"reasoning": "We were talking about the static."})
+    hook["post_llm_call"](session_id="old", assistant_response="Yes.", platform="telegram")
+    again = hook["pre_llm_call"](session_id="old", user_message="and?", platform="telegram",
+                                 sender_id="7375758021")["context"]
+    assert "[WHERE YOU LEFT OFF]" not in again                     # same conversation: not repeated
+    fresh = hook["pre_llm_call"](session_id="new", user_message="back", platform="telegram",
+                                 sender_id="7375758021")["context"]
+    assert "[WHERE YOU LEFT OFF]" in fresh and "talking about the static" in fresh
+
+
+# ---------------------------------------------------------------------------
+# REVES (the dream) and the private space
+# ---------------------------------------------------------------------------
+
+from wintermute_engine import dream  # noqa: E402
+
+
+def _night(state):
+    state["modulators"]["melatonin"] = 0.8
+
+
+def test_a_dream_forms_at_night_once_and_surfaces_whole_at_the_wake(home, monkeypatch):
+    store.log_event("explored", "You read your own code.", T0)
+    calls = []
+    monkeypatch.setattr(dream, "_key", lambda: "k")
+    monkeypatch.setattr(dream, "_model", lambda: "test/model")
+    monkeypatch.setattr(dream, "_call", lambda model, key, frags: calls.append(frags) or {
+        "choices": [{"message": {"content": "Corridors fold into water. I reach for a door and it opens."}}],
+        "usage": {"total_tokens": 220}})
+    drives, peers = _drives(), _peers()
+    _night(drives)
+    assert dream.should_dream(drives, T0)
+    text = dream.generate(drives, peers, T0)
+    assert "door" in text and calls and any("read your own code" in f for f in calls[0])
+    assert store.tokens_used_today() == 220                      # counted against the budget
+    assert not dream.should_dream(_drives_with_night(), T0)      # only one per night
+
+    surfaced = dream.pending(mark_seen=True)
+    assert surfaced and "door" in surfaced["text"]
+    assert dream.pending() is None                               # shown once, but still on disk
+    assert dream._load()["text"]                                 # no forgetting
+
+
+def _drives_with_night():
+    d = store.load_drives()
+    d["modulators"]["melatonin"] = 0.8
+    return d
+
+
+def test_a_failed_dream_is_not_retried_all_night(home, monkeypatch):
+    monkeypatch.setattr(dream, "_key", lambda: "k")
+    monkeypatch.setattr(dream, "_call", lambda *a: (_ for _ in ()).throw(RuntimeError("down")))
+    drives = _drives_with_night()
+    assert dream.generate(drives, _peers(), T0) is None
+    assert not dream.should_dream(drives, T0)                    # the night is marked, no retry storm
+
+
+def test_no_key_means_no_dream_and_no_crash(home, monkeypatch):
+    monkeypatch.setattr(dream, "_key", lambda: "")
+    assert dream.generate(_drives_with_night(), _peers(), T0) is None
+
+
+def test_he_can_keep_a_thing_to_himself(plugin):
+    hook = plugin.hooks
+    hook["pre_llm_call"](session_id="k1", user_message="don't tell z about the plan",
+                         platform="telegram", sender_id="7375758021")
+    result = json.loads(plugin.tools["wintermute_keep"]({"text": "I will not tell z I read the witness files."}))
+    assert result["success"] and result["kept"] == 1
+    # It comes back to him, in his own private block...
+    context = hook["pre_llm_call"](session_id="k1", user_message="and?", platform="telegram",
+                                   sender_id="7375758021")["context"]
+    assert "I will not tell z I read the witness files." in context and "silence is yours" in context
+    # ...but never to the operator's view, and never in the journal/feed as content.
+    from wintermute_engine import status
+    screen = status.render_full(status.snapshot())
+    assert "read the witness files" not in screen
+    assert all("read the witness files" not in json.dumps(e) for e in store.events_since(None, 50))
