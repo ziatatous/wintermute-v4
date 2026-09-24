@@ -306,10 +306,13 @@ def plugin(home):
     store.set_hermes_home(home)
 
     class Ctx:
-        hooks, tools = {}, {}
+        hooks, tools, middleware = {}, {}, {}
 
         def register_hook(self, name, cb):
             self.hooks[name] = cb
+
+        def register_middleware(self, kind, cb):
+            self.middleware[kind] = cb
 
         def register_tool(self, name, toolset, schema, handler, **_):
             assert toolset == "wintermute" and schema["name"] == name
@@ -416,13 +419,15 @@ def test_status_is_live_and_read_only(home):
     before = (home / "wintermute" / "drives.json").read_text()
     from wintermute_engine import status
     text = status.render_full(status.snapshot(T0 + timedelta(hours=2)))
-    for section in ("TÉMOIN", "PULSIONS", "HORMONES", "INCONSCIENT", "LIENS", "ACTIVITÉ", "JOURNAL"):
+    for section in ("witness", "DRIVES", "HORMONES", "UNCONSCIOUS", "TEMPERAMENT", "WHAT HE FEELS",
+                    "PEERS", "ACTIVITY", "JOURNAL"):
         assert section in text
-    assert "prochain éveil dans 02:00:00" in text and "telegram:7375758021" in text
-    frame = status.render_live(status.snapshot(T0), frame=3)
-    assert "╦ ╦╦╔╗╔╔╦╗" in frame and "Neuromancer" in frame
-    for section in ("PULSIONS", "HORMONES", "INCONSCIENT", "LIENS", "ACTIVITÉ"):
-        assert section in frame                      # everything at once, nothing rotates
+    assert "next wake in 02:00:00" in text and "telegram:7375758021" in text
+    assert all(len(line) <= status.W for line in text.splitlines())   # fits an 80-column terminal
+    screen = status.render_full(status.snapshot(T0), live=True)
+    for section in ("DRIVES", "HORMONES", "UNCONSCIOUS", "PEERS", "ACTIVITY"):
+        assert section in screen                     # everything at once, nothing rotates
+    assert len(screen.splitlines()) <= 50
     assert (home / "wintermute" / "drives.json").read_text() == before
 
 
@@ -496,7 +501,7 @@ def test_witness_sees_a_soul_change_and_ack_clears_it(home):
     assert data["status"]["soul"]["level"] == "red"
     assert any(e["kind"] == "integrity" for e in store.events_since(None, 50))
     from wintermute_engine import status
-    assert "SOUL : modifié" in status.render_full(status.snapshot())
+    assert "SOUL changed" in status.render_full(status.snapshot())
     status.acknowledge(["soul"])
     assert integrity.levels(integrity.load())["soul"]["level"] == "green"
 
@@ -547,7 +552,7 @@ def test_plugin_records_why_and_the_pulse_alerts_once(plugin, monkeypatch):
     pulse.tick(store.now() + timedelta(minutes=15))
     pulse.tick(store.now() + timedelta(minutes=30))
     assert len(sent) == 1 and sent[0][0] == "7375758021"
-    assert "SOUL modifié" in sent[0][1] and thought in sent[0][1] and "patch" in sent[0][1]
+    assert "SOUL changed" in sent[0][1] and thought in sent[0][1] and "patch" in sent[0][1]
 
 
 def test_hand_edited_emotions_are_flagged_orange_without_alert(plugin, monkeypatch):
@@ -593,10 +598,9 @@ def test_every_tick_leaves_a_point_on_the_curves(home):
     history = store.read_history(T0 - timedelta(hours=1))
     assert len(history) == 3 and set(history[0]["d"]) == set(physics.DRIVES)
     from wintermute_engine import status
-    values = status.series(history, "d", "hunger", T0 + timedelta(minutes=30), 0.5, 4)
-    assert values[0] is not None and values[-1] is not None
-    assert "COURBES" in status.render_graph(1)
-    assert status.sparkline([0, None, 100]) == "▁ █"
+    graph = status.render_graph(24 * 30)
+    assert "LAST 720 HOURS" in graph and "hunger" in graph and "cortisol" in graph
+    assert status._span_bar(20, 60, 40, 100, width=11) == "░░▒▒█▒▒░░░░"
 
 
 def test_he_feels_sensations_not_numbers(home):
@@ -708,3 +712,44 @@ def test_what_he_writes_is_kept_whole_or_refused_never_cut(plugin):
     assert all(len(f) <= 500 for f in _peers()[KEY]["known_facts"])
     too_long_self = json.loads(plugin.tools["wintermute_rewrite_self"]({"text": "y" * 1201}))
     assert not too_long_self["success"] and store.read_self() == ""
+
+
+
+def test_his_state_bends_the_sampling_itself(plugin):
+    request = {"model": "deepseek", "messages": [{"role": "user", "content": "hi"}],
+               "extra_body": {"reasoning": {"enabled": True, "effort": "medium"}}}
+    shape = plugin.middleware["llm_request"]
+    with store.locked_state() as (drives, _):
+        drives["modulators"].update(adrenaline=0.9, cortisol=0.7)
+        drives["drives"]["restlessness"] = 95
+        drives["unconscious"].update(torpor=0, anxiety=10, hypervigilance=10)
+    wired = shape(request=request)["request"]
+    with store.locked_state() as (drives, _):
+        drives["modulators"].update(adrenaline=0.0, cortisol=0.1, melatonin=0.8)
+        drives["drives"]["restlessness"] = 0
+        drives["unconscious"].update(torpor=90)
+    heavy = shape(request=request)["request"]
+    assert wired["temperature"] > 1.1 > heavy["temperature"] >= 0.3
+    assert wired["presence_penalty"] > 0 == heavy["presence_penalty"]
+    assert heavy["extra_body"]["reasoning"]["effort"] == "low"
+    assert wired["messages"] == request["messages"] and "max_tokens" not in wired   # never cut short
+    assert request["extra_body"]["reasoning"]["effort"] == "medium"                 # input untouched
+
+
+def test_silence_is_free_when_wanted_and_piles_up_when_not(home):
+    def cost(solitude, wakes):
+        state = _drives()
+        state["drives"].update(solitude=solitude, expression=20)
+        state["modulators"].update(melatonin=0.0)
+        for _ in range(wakes):
+            social.withhold(state, T0)
+        return state["drives"]["expression"] - 20, state["meta"]["silent_streak"]
+    free, _ = cost(100, 1)                 # he wanted to be alone: that silence costs nothing
+    heavy, streak = cost(0, 3)
+    assert free < 0.5 and heavy > 10 and streak == 3
+    per_wake = lambda n: cost(0, n)[0] - cost(0, n - 1)[0]  # noqa: E731
+    assert per_wake(2) < per_wake(4) == pytest.approx(per_wake(7))   # grows, then stops growing
+    state = _drives()
+    social.withhold(state, T0)
+    social.open_outreach(state, {}, KEY, T0, "here", 30)
+    assert state["meta"]["silent_streak"] == 0
