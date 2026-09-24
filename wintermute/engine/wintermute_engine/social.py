@@ -58,8 +58,89 @@ def expectation_word(expect: float) -> str:
     return "you were not sure they would"
 
 
+def resolve_key(drives: Dict[str, Any], key: str) -> str:
+    """A person can be known under several ids across platforms; he links them himself. This
+    follows the link chain to the one profile that holds them all."""
+    links = (drives.get("meta") or {}).get("identity_links") or {}
+    seen = set()
+    while key in links and key not in seen:
+        seen.add(key)
+        key = links[key]
+    return key
+
+
+def link_identities(drives: Dict[str, Any], peers: Dict[str, Any], key_a: str, key_b: str,
+                    ts: datetime) -> Optional[str]:
+    """Declare that ``key_a`` and ``key_b`` are the same person. Their bonds and history merge
+    into one profile (the richer one wins), and the other id becomes an alias of it. Returns the
+    surviving key, or None if they are already one."""
+    a, b = resolve_key(drives, key_a), resolve_key(drives, key_b)
+    if a == b:
+        return None
+    ensure_peer(drives, peers, a, ts)
+    ensure_peer(drives, peers, b, ts)
+    # The id he names (key_b, "you are also <this>") is the identity that survives; the one he is
+    # talking through (key_a) folds into it and becomes an alias. Predictable, and it makes the
+    # matching unlink obvious.
+    canonical, alias = b, a
+    keep, gone = peers[canonical], peers.pop(alias)
+    for field in ("known_facts", "moments", "pending"):
+        merged = list(keep.get(field) or [])
+        for item in gone.get(field) or []:
+            if item not in merged:
+                merged.append(item)
+        keep[field] = merged[-20:]
+    for field in ("affinity", "trust", "curiosity", "oxytocin", "longing"):
+        keep[field] = max(physics.safe_float(keep.get(field)), physics.safe_float(gone.get(field)))
+    keep["disappointment"] = min(physics.safe_float(keep.get("disappointment")),
+                                 physics.safe_float(gone.get("disappointment")))
+    for field in ("messages_from_them", "messages_to_them", "ignored_count"):
+        keep[field] = int(physics.safe_float(keep.get(field))) + int(physics.safe_float(gone.get(field)))
+    if not keep.get("label") and gone.get("label"):
+        keep["label"] = gone["label"]
+    if not (isinstance(keep.get("outreach"), dict) and keep["outreach"].get("status") in ("open", "expired")):
+        if isinstance(gone.get("outreach"), dict):
+            keep["outreach"] = gone["outreach"]
+    keep.setdefault("aliases", [])
+    for extra in [alias] + list(gone.get("aliases") or []):
+        if extra not in keep["aliases"]:
+            keep["aliases"].append(extra)
+    meta = drives.setdefault("meta", {})
+    links = meta.setdefault("identity_links", {})
+    links[alias] = canonical
+    for k, v in list(links.items()):          # redirect anything that pointed at the alias
+        if v == alias:
+            links[k] = canonical
+    physics.refresh_oxytocin_global(drives, peers)
+    store.log_event("link", f"You recognized {alias} as the same person as {canonical}.", ts,
+                    peer=canonical)
+    return canonical
+
+
+def unlink_identity(drives: Dict[str, Any], peers: Dict[str, Any], wrong_key: str,
+                    ts: datetime) -> Optional[str]:
+    """He got a link wrong. Detach ``wrong_key`` so it is its own person again from now on. The
+    id starts fresh on its next message; facts already merged stay on the kept profile (he can
+    prune them with note_peer) — a wrong link is never permanent. Returns the detached id."""
+    meta = drives.setdefault("meta", {})
+    links = meta.setdefault("identity_links", {})
+    canonical = links.pop(wrong_key, None)
+    if canonical is None:
+        return None
+    for k, v in list(links.items()):          # anything chained through it points at the survivor now
+        if v == wrong_key:
+            links[k] = canonical
+    keep = peers.get(canonical)
+    if isinstance(keep, dict):
+        keep["aliases"] = [a for a in keep.get("aliases") or [] if a != wrong_key]
+    store.log_event("unlink", f"You separated {wrong_key} from {canonical} — a link you undid.",
+                    ts, peer=canonical)
+    return wrong_key
+
+
 def ensure_peer(drives: Dict[str, Any], peers: Dict[str, Any], key: str,
                 ts: datetime) -> Dict[str, Any]:
+    key = resolve_key(drives, key)
     peer = peers.get(key)
     if peer is None:
         peer = store.new_peer(ts)
@@ -72,6 +153,7 @@ def ensure_peer(drives: Dict[str, Any], peers: Dict[str, Any], key: str,
 def on_incoming(drives: Dict[str, Any], peers: Dict[str, Any], key: str,
                 ts: datetime) -> List[str]:
     """A message from ``key`` arrived. Returns context lines about pending outreach."""
+    key = resolve_key(drives, key)
     peer = ensure_peer(drives, peers, key, ts)
     lines: List[str] = []
     last = store.parse_time(peer.get("last_interaction"))
