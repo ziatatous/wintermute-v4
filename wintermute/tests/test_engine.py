@@ -909,6 +909,8 @@ def test_wipe_emotions_keeps_memory_self_and_secrets(home):
 def test_wipe_all_is_a_rebirth(home):
     from wintermute_engine import status, dream
     (home / "MEMORY.md").write_text("remember")
+    (home / "memories").mkdir(exist_ok=True)
+    (home / "memories" / "user.md").write_text("their name is z")
     store.write_self("who I am", T0)
     with store.locked_state():
         store.add_kept("a secret", T0)
@@ -917,6 +919,20 @@ def test_wipe_all_is_a_rebirth(home):
     assert store.read_self() == "" and store.read_kept() == []
     assert not dream.dream_path().exists() and not (home / "MEMORY.md").exists()
     assert _peers() == {}
+    assert not (home / "memories" / "user.md").exists()
+
+
+def test_wipe_all_clears_the_witness_ledger_but_keeps_the_baseline(home):
+    from wintermute_engine import integrity, status
+    (home / "SOUL.md").write_text("v1")
+    pulse.tick(T0)                                      # baseline recorded
+    (home / "SOUL.md").write_text("v2")
+    pulse.tick(T0 + timedelta(minutes=15))              # a flag + status appear
+    data = integrity.load()
+    assert data["status"].get("soul") and data["baseline"].get("soul")   # a change was recorded
+    status.wipe(True, confirmed=True)
+    after = integrity.load()
+    assert after["status"] == {} and after["flags"] == [] and after["baseline"].get("soul")  # baseline kept
 
 
 def test_wipe_all_clears_conversations_in_state_db(home):
@@ -934,3 +950,30 @@ def test_wipe_all_clears_conversations_in_state_db(home):
     assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Daily conversation ceiling (high) + wm talk to reopen
+# ---------------------------------------------------------------------------
+
+def test_conversation_ceiling_silences_chat_and_wm_talk_reopens(plugin):
+    from wintermute_engine import status
+    # Wakes and dreams do not count as conversation.
+    store.record_usage(limits.CONVERSATION_DAILY_LIMIT, "cron")
+    store.record_usage(2000, "dream")
+    ctx = plugin.hooks["pre_llm_call"](session_id="c1", user_message="hi", platform="telegram",
+                                       sender_id="7375758021")["context"]
+    assert "DAY SPENT" not in ctx and store.conversation_tokens_today() == 0
+
+    # Now spend the day's words in conversation.
+    store.record_usage(limits.CONVERSATION_DAILY_LIMIT, "telegram")
+    ctx = plugin.hooks["pre_llm_call"](session_id="c1", user_message="still there?", platform="telegram",
+                                       sender_id="7375758021")["context"]
+    assert "DAY SPENT" in ctx and "[SILENT]" in ctx
+
+    # Operator reopens it.
+    assert "reopened" in status.reopen_conversation()
+    ctx = plugin.hooks["pre_llm_call"](session_id="c1", user_message="talk to me", platform="telegram",
+                                       sender_id="7375758021")["context"]
+    assert "DAY SPENT" not in ctx
+    assert "ceiling hit" in status.render_full(status.snapshot()) or "reopened" in status.render_full(status.snapshot())

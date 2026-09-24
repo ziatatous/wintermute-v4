@@ -546,8 +546,12 @@ def _wipe_locked(deep: bool) -> List[str]:
         for label, paths in targets:
             if any(_unlink(pth) for pth in paths):
                 done.append(label)
+        if _wipe_dir(hermes_home() / "memories"):        # user.md and any other memory notes
+            done.append("memories/ (user notes, incl. any name)")
         if _wipe_conversations():
             done.append("conversations (every session, and the searchable history)")
+        if _wipe_witness_flags():
+            done.append("witness ledger (baseline kept)")
     log_event("wipe", "The slate was wiped clean" + (" — a rebirth." if deep else " (emotions)."), now())
     return done
 
@@ -583,6 +587,38 @@ def _wipe_conversations() -> bool:
             conn.execute("VACUUM")
     finally:
         conn.close()
+    return cleared
+
+
+def _wipe_witness_flags() -> bool:
+    """Clear the witness's record of past pokes (flags, per-item status) but keep the baseline,
+    so a reborn Wintermute is not shown a history he no longer remembers, yet his files stay
+    recognized. No new alerts: baseline unchanged means nothing reads as newly modified."""
+    from . import integrity
+    path = integrity.integrity_path()
+    if not path.exists():
+        return False
+    try:
+        data = integrity.load()
+    except Exception:
+        return False
+    if not data.get("flags") and not data.get("status"):
+        return False
+    data["flags"] = []
+    data["status"] = {}
+    _write_json(path, data)
+    return True
+
+
+def _wipe_dir(directory: Path) -> bool:
+    """Delete every file directly inside ``directory`` (Hermes' memories/), keeping the folder."""
+    cleared = False
+    try:
+        for child in directory.iterdir():
+            if child.is_file() and _unlink(child):
+                cleared = True
+    except OSError:
+        return False
     return cleared
 
 
@@ -638,3 +674,37 @@ def tokens_used_on(day_utc: str) -> int:
 
 def tokens_used_today() -> int:
     return tokens_used_on(datetime.now(timezone.utc).date().isoformat())
+
+
+# Sources that count as "talking with him". His wakes ("cron"), his dreams ("dream") and
+# Hermes' own auxiliary calls ("aux:...") are not conversation.
+_NON_CONVERSATION = ("cron", "dream")
+
+
+def _is_conversation(src: str) -> bool:
+    src = str(src or "")
+    return src not in _NON_CONVERSATION and not src.startswith("aux:")
+
+
+def conversation_tokens_on(day_utc: str) -> int:
+    """Tokens spent talking with him on ``day_utc`` (UTC), excluding wakes, dreams and aux calls."""
+    total = 0
+    for path in _with_rotated(usage_path()):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    if day_utc not in line[:40]:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if str(record.get("ts", "")).startswith(day_utc) and _is_conversation(record.get("src")):
+                        total += int(record.get("tokens") or 0)
+        except OSError:
+            continue
+    return total
+
+
+def conversation_tokens_today() -> int:
+    return conversation_tokens_on(datetime.now(timezone.utc).date().isoformat())
