@@ -214,6 +214,7 @@ en contexte. Pour vérifier que le plugin est chargé : `hermes plugins list`, e
 | `wm live` | le même écran rafraîchi toutes les 2 s, sans animation (Ctrl+C pour quitter) |
 | `wm brain` | **scan cérébral en direct** : un cerveau 3D en fil de fer qui tourne (déco), et à côté ses régions (drives, hormones, inconscient) posées sur un cortex, colorées par niveau ; les connexions **s'allument quand ça fire** (une émotion, un message, un outil) puis s'éteignent en ~2 s. Truecolor si le terminal le gère, sinon 256 couleurs. Sans dépendance |
 | `wm graph` / `wm graph 72` | pour chaque valeur sur 48 (ou 72…) h : une barre simple ░ jamais atteint, ▒ plage vécue, █ maintenant, avec min / moyenne / max |
+| `wm dreams` / `wm dreams 20` | son journal de rêves, du plus récent au plus ancien (tonalité + texte) |
 | `wm forget <peer>` | efface un interlocuteur (ex. `cli:local`) |
 | `wm wipe --yes` | ardoise propre émotionnelle : remet à zéro pulsions, hormones, tempérament, entropie, liens et courbes ; garde mémoire, autoportrait, secrets, journaux |
 | `wm wipe --all --yes` | renaissance : efface **tout** ce qu'il est devenu — plus `MEMORY.md`, autoportrait, secrets, rêves, journaux, **et toutes les conversations** (state.db, y compris `session_search`). Garde SOUL, clés, code. Aucune copie. Ensuite : `hermes gateway restart` + `/reset` |
@@ -337,6 +338,10 @@ pesant plus. Le rêve est **abstrait** ; ce qu'il s'imagine **faire** est préci
 marque la nuit (pas de tempête de tentatives).
 
 À décider plus tard : le subconscient peut-il parfois souffler une image pendant un éveil ?
+
+Chaque rêve est aussi ajouté à un **journal** (`dreams.jsonl`, consultable avec `wm dreams`) :
+`dream.json` ne garde que le dernier (montré une fois au réveil, puis relisible par lui via
+ses outils fichier), le journal les garde tous, pour voir comment il évolue de nuit en nuit.
 
 ## Plus tard : Discord
 
